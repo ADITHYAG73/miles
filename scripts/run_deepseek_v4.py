@@ -115,7 +115,9 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
     dsa_kernel_backend: Literal["none", "tilelang", "cudnn"] | None = None
     optimizer_offload: bool = True
     use_fault_tolerance: bool = True
-    cp_size: int = 1
+    # None runs each recipe's own CP. Only the single-node miles impl lets it vary (TP takes the GPUs
+    # CP leaves, CP split with --allgather-cp); every other recipe accepts only its own CP size.
+    cp_size: int | None = None
 
     # debug configs
     dump_details: bool = False
@@ -153,6 +155,7 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
             assert not (self.train_mxfp8 or self.rollout_mxfp8), "train_mxfp8/rollout_mxfp8 require Blackwell"
         assert self.rollout_num_nodes >= 0
         assert self.rollout_num_nodes < self.num_nodes
+        assert self.cp_size is None or self.cp_size >= 1, f"cp_size must be at least 1, got {self.cp_size}"
         self.colocate = self.rollout_num_nodes == 0
         self.actor_num_nodes = self.num_nodes - self.rollout_num_nodes
         self.actor_num_gpus_per_node = self.num_gpus_per_node
@@ -399,22 +402,13 @@ def _get_parallel_config(args: ScriptArgs) -> str:
     # Single-node smoke-test configs
     if actor_num_nodes == 1:
         if args.dsv4_impl == "megatron":
+            # dsv4_hybrid needs cp_partition_mode='contiguous' for CP>1, which miles does not set
             # The plugin rejects TP>1; the TP ranks go to DP instead.
-            return (
-                "--tensor-model-parallel-size 1 "
-                "--pipeline-model-parallel-size 1 "
-                "--context-parallel-size 1 "
-                f"--expert-model-parallel-size {actor_num_gpus_per_node} "
-                "--expert-tensor-parallel-size 1 "
-            )
-        return (
-            f"--tensor-model-parallel-size {actor_num_gpus_per_node} "
-            "--sequence-parallel "
-            "--pipeline-model-parallel-size 1 "
-            "--context-parallel-size 1 "
-            f"--expert-model-parallel-size {actor_num_gpus_per_node} "
-            "--expert-tensor-parallel-size 1 "
-        )
+            return _parallel_flags(args, tp=1, cp=1, ep=actor_num_gpus_per_node)
+        cp_size = args.cp_size or 1
+        if actor_num_gpus_per_node % cp_size:
+            raise NotImplementedError(f"cp_size={cp_size} does not divide {actor_num_gpus_per_node} GPUs")
+        return _parallel_flags(args, tp=actor_num_gpus_per_node // cp_size, cp=cp_size, ep=actor_num_gpus_per_node)
 
     if actor_num_gpus_per_node == 4:
         if total_gpus == 32:  # 8 nodes x 4 GPUs
@@ -423,55 +417,42 @@ def _get_parallel_config(args: ScriptArgs) -> str:
                 # CP>1, which no launcher exercises yet -- so the TP and CP ranks both go
                 # to DP. max-tokens-per-gpu below doubles to keep the per-micro-batch
                 # budget (max_tokens_per_gpu * cp_size) equal to the miles recipe's.
-                return (
-                    "--tensor-model-parallel-size 1 "
-                    "--pipeline-model-parallel-size 8 "
-                    "--decoder-first-pipeline-num-layers 4 "
-                    "--decoder-last-pipeline-num-layers 3 "
-                    "--context-parallel-size 1 "
-                    "--expert-model-parallel-size 4 "
-                    "--expert-tensor-parallel-size 1 "
-                )
-            return (
-                "--tensor-model-parallel-size 2 "
-                "--sequence-parallel "
-                "--pipeline-model-parallel-size 8 "
-                "--decoder-first-pipeline-num-layers 4 "
-                "--decoder-last-pipeline-num-layers 3 "
-                "--context-parallel-size 2 "
-                "--allgather-cp "
-                "--expert-model-parallel-size 4 "
-                "--expert-tensor-parallel-size 1 "
-            )
+                return _parallel_flags(args, tp=1, pp=8, pp_edge_layers=(4, 3), cp=1, ep=4)
+            return _parallel_flags(args, tp=2, pp=8, pp_edge_layers=(4, 3), cp=2, ep=4)
 
     if actor_num_gpus_per_node == 8:
         if total_gpus == 64:  # 8 nodes x 8 GPUs
-            return (
-                "--tensor-model-parallel-size 8 "
-                "--sequence-parallel "
-                "--pipeline-model-parallel-size 8 "
-                "--decoder-first-pipeline-num-layers 4 "
-                "--decoder-last-pipeline-num-layers 3 "
-                "--context-parallel-size 1 "
-                "--expert-model-parallel-size 8 "
-                "--expert-tensor-parallel-size 1 "
-            )
+            return _parallel_flags(args, tp=8, pp=8, pp_edge_layers=(4, 3), cp=1, ep=8)
         elif total_gpus == 256:  # 32 nodes x 8 GPUs (Pro)
-            return (
-                "--tensor-model-parallel-size 8 "
-                "--sequence-parallel "
-                "--pipeline-model-parallel-size 8 "
-                "--decoder-first-pipeline-num-layers 7 "
-                "--decoder-last-pipeline-num-layers 6 "
-                "--context-parallel-size 1 "
-                "--expert-model-parallel-size 32 "
-                "--expert-tensor-parallel-size 1 "
-            )
+            return _parallel_flags(args, tp=8, pp=8, pp_edge_layers=(7, 6), cp=1, ep=32)
 
     raise NotImplementedError(
         f"No pre-set parallel config for {total_gpus} GPUs. "
         f"Please specify your parallel config in `run_deepseek_v4._get_parallel_config`."
     )
+
+
+def _parallel_flags(
+    args: ScriptArgs, *, tp: int, cp: int, ep: int, pp: int = 1, pp_edge_layers: tuple[int, int] | None = None
+) -> str:
+    """One recipe's parallel flags; a recipe runs its own CP size, so ``cp_size`` must be unset or equal."""
+    if args.cp_size not in (None, cp):
+        raise NotImplementedError(
+            f"cp_size={args.cp_size} is untested here: this recipe (--dsv4-impl {args.dsv4_impl}, "
+            f"{args.actor_num_nodes}x{args.actor_num_gpus_per_node} GPUs) runs CP{cp}"
+        )
+    flags = [f"--tensor-model-parallel-size {tp}"]
+    if tp > 1:
+        flags.append("--sequence-parallel")
+    flags.append(f"--pipeline-model-parallel-size {pp}")
+    if pp_edge_layers is not None:
+        first, last = pp_edge_layers
+        flags += [f"--decoder-first-pipeline-num-layers {first}", f"--decoder-last-pipeline-num-layers {last}"]
+    flags.append(f"--context-parallel-size {cp}")
+    if cp > 1:
+        flags.append("--allgather-cp")  # DeepSeek V4 rejects the zigzag CP split
+    flags += [f"--expert-model-parallel-size {ep}", "--expert-tensor-parallel-size 1"]
+    return "".join(f"{flag} " for flag in flags)
 
 
 def _train(args: ScriptArgs):
