@@ -41,7 +41,13 @@ def make_transfer_buffers(monkeypatch: pytest.MonkeyPatch):
 
 
 def _remote_shard(session_id: str) -> RemoteShard:
-    return RemoteShard(rollout_engine_ind=0, rollout_engine_rank=0, session_id=session_id, weight_locations_by_name={})
+    return RemoteShard(
+        rollout_engine_ind=0,
+        rollout_engine_rank=0,
+        runner_role="target",
+        session_id=session_id,
+        weight_locations_by_name={},
+    )
 
 
 def _start_in_thread(target) -> threading.Event:

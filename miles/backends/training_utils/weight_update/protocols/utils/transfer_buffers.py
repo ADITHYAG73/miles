@@ -82,8 +82,8 @@ def _raise_if_any_write_failed(pending_writes: list[tuple[RemoteShard, Future]],
         else:
             continue
         failures.append(
-            f"rollout engine {remote_shard.rollout_engine_ind} rank {remote_shard.rollout_engine_rank} "
-            f"(session {remote_shard.session_id}): {reason}"
+            f"the {remote_shard.runner_role} of rollout engine {remote_shard.rollout_engine_ind} rank "
+            f"{remote_shard.rollout_engine_rank} (session {remote_shard.session_id}): {reason}"
         )
     if failures:
         raise RuntimeError(f"{len(failures)} of {len(pending_writes)} p2p writes failed:\n" + "\n".join(failures))
