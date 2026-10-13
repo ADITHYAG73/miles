@@ -260,8 +260,6 @@ def build_train_args(case: CaseConfig, *, wandb_file: str) -> str:
         mtp_args = "--enable-mtp-training " "--mtp-loss-scaling-factor 0.2 "
 
     ci_args = "--ci-test "
-    if not case.use_spec:
-        ci_args += "--check-weight-update-selector target "
     if case.use_fp8_rollout:
         ci_args += "--check-weight-update-allow-quant-error "
 
