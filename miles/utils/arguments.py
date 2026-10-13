@@ -14,6 +14,7 @@ from miles.backends.megatron_utils.megatron_config import (
     CRITIC_ROLE,
     resolve_args_checkpoint_load,
     resolve_megatron_config,
+    resolve_mtp_num_layers,
 )
 from miles.backends.sglang_utils.arguments import add_sglang_arguments, collect_eval_sglang_overrides
 from miles.backends.sglang_utils.arguments import validate_args as sglang_validate_args
@@ -2555,13 +2556,24 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
 
         def add_mtp_training_arguments(parser):
             """Add MTP training specific arguments."""
+            # The model's MTP layers; built only under --enable-mtp-training, since Megatron trains any it builds.
             reset_arg(parser, "--mtp-num-layers", type=int, default=None)
             reset_arg(parser, "--mtp-loss-scaling-factor", type=float, default=0.2)
             parser.add_argument(
                 "--enable-mtp-training",
                 action="store_true",
                 default=False,
-                help="Enable MTP layer parameter updates during training",
+                help="Build and train the model's --mtp-num-layers MTP layers alongside the policy (megatron "
+                "only). Without it no MTP layer is built, so exported checkpoints carry no MTP weights.",
+            )
+            # Megatron's own TransformerConfig flag, defaulted on so MTP loss trains only the MTP layers.
+            reset_arg(parser, "--mtp-detach-heads", action="store_true", default=True)
+            parser.add_argument(
+                "--no-mtp-detach-heads",
+                dest="mtp_detach_heads",
+                action="store_false",
+                help="Let MTP loss gradients flow back into the main model's embedding, output layer and "
+                "hidden states.",
             )
 
             return parser
@@ -3782,7 +3794,7 @@ def miles_validate_args(args):
                 "--stream-optimizer-state-to-disk does not support --log-num-zeros-in-grad: the zero count reads "
                 "the fp32 gradients outside the step, where the streamed params have none"
             )
-            assert not args.enable_mtp_training, (
+            assert not (args.enable_mtp_training and args.mtp_detach_heads), (
                 "--stream-optimizer-state-to-disk does not support --enable-mtp-training: the detached MTP heads "
                 "are clipped by their own grad norm, which reads the fp32 gradients outside the step"
             )
@@ -3896,7 +3908,15 @@ def miles_validate_args(args):
             )
 
     if args.enable_mtp_training:
-        assert args.mtp_num_layers, "mtp_num_layers must be set when enable_mtp_training is set"
+        assert (
+            args.train_backend == "megatron"
+        ), f"--enable-mtp-training is megatron-only: the {args.train_backend} backend builds no MTP layers"
+        if not args.mtp_detach_heads:
+            logger.warning(
+                "--no-mtp-detach-heads: MTP loss gradients flow back into the main model's embedding, "
+                "output layer and hidden states, so the MTP loss also trains the policy"
+            )
+    resolve_mtp_num_layers(args)
 
     if args.use_rollout_routing_replay:
         args.use_routing_replay = True
