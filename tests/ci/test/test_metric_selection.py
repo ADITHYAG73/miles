@@ -194,7 +194,7 @@ def test_parse_all_fields(tmp_path):
 
 def test_declaration_keys_are_canonical_json(tmp_path):
     # Dict keys are sorted and every literal is whitespace-free regardless of
-    # how the author wrote it; this pins the exact stored-identity format.
+    # how the author wrote it; this pins the stored format older readers match on.
     path = _make_fixture(
         """
         from tests.ci.metric_history import register_ci_gate
@@ -215,7 +215,7 @@ def test_declaration_keys_are_canonical_json(tmp_path):
 def test_declaration_keys_use_raw_literal_not_normalized(tmp_path):
     # The normalized constraint fills the omitted params from code; the key
     # must come from the literal as written, so a code-side default change
-    # can never silently rewrite keys and reset every series.
+    # never rewrites the stored literal that older readers match on.
     path = _make_fixture(
         """
         from tests.ci.metric_history import register_ci_gate
@@ -453,6 +453,20 @@ def test_unknown_steps_keyword_rejected(tmp_path):
         tmp_path,
     )
     with pytest.raises(ValueError, match='steps must be "last", "all"'):
+        parse_ci_gate_specs(path)
+
+
+def test_metric_declared_twice_rejected(tmp_path):
+    # History is keyed by metric and step, so a second rule for one metric has no series of its own.
+    path = _make_fixture(
+        """
+        from tests.ci.metric_history import register_ci_gate
+        register_ci_gate(metric_key="train/x", steps="last", constraint={"rel_up": 0.2, "rel_down": 0.2})
+        register_ci_gate(metric_key="train/x", steps=[0], constraint={"rel_up": 0.5, "rel_down": 0.5})
+        """,
+        tmp_path,
+    )
+    with pytest.raises(ValueError, match="declares metric_key 'train/x' more than once"):
         parse_ci_gate_specs(path)
 
 
